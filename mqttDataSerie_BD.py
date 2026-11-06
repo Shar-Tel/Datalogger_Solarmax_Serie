@@ -12,13 +12,18 @@ import xml.etree.ElementTree as ET
 import paho.mqtt.client as mqttClient
 import json
 import select
+from contextlib import closing
 from datetime import datetime
-import configparser as ConfigParser 
+import configparser as ConfigParser
 import serial
-import select
+import threading
 import termios
 import tty
 import sqlite3 as lite
+
+
+_publish_condition = threading.Condition()
+_pending_publish_events = {}
 
 
 IDC = "IDC"	  # DC Current
@@ -65,13 +70,19 @@ QUERY_DICT = {
 
 
 def on_connect(client, userdata, flags, rc):
-	global Connected				#Use global variable
-	if rc == 0:
-		Connected = True				#Signal connection 
-	else:
+	global Connected
+	Connected = rc == 0
+	if not Connected:
 		print("Connection failed")
-		
-		
+
+
+def on_publish(client, userdata, mid, *args):
+	with _publish_condition:
+		event = _pending_publish_events.get(mid)
+		if event is not None:
+			event.set()
+
+
 def hex_checksum(line):
 	"""Return the HEX Checksum"""
 	total = 0
@@ -159,7 +170,7 @@ def genData(s):
 		return None
 
 def convert_data(data):
-	global planta,inverter_linea
+	global planta
 	# pull out the data elements into a list  and replace the code with the json field name
 	ev = [genData(s) for s in data[data.find(':')+1:data.find('|', data.find(':'))].split(';')]
 	#Le quito los que sean None por si algún dato no existe
@@ -223,6 +234,7 @@ def conectar(user, password, broker_address, port):
 		#client = mqttClient.Client(mqttClient.CallbackAPIVersion.VERSION2, planta+"_LeeSungrowIP")               #create new instance
 		client.username_pw_set(user, password=password)    #set username and password
 		client.on_connect= on_connect                      #attach function to callback
+		client.on_publish = on_publish
 		client.connect(broker_address, port=port)          #connect to broker	
 		client.loop_start()        #start the loop
 	except Exception as e:
@@ -233,65 +245,89 @@ def conectar(user, password, broker_address, port):
 
 def guardaBD(datos):
 	"""Guarda en la SQLite los datos que se le pasan"""
-	con = lite.connect('Lecturas.sqlite')
-	with con:
-			cur = con.cursor()
-			cur.execute("INSERT INTO Lecturas_guardadas_inverters_Solarmax (dato) VALUES (?)",[datos])
-			con.commit()
-	con.close()
+	with closing(lite.connect('Lecturas.sqlite')) as con:
+		with con:
+			con.execute(
+				"INSERT INTO Lecturas_guardadas_inverters_Solarmax (dato) VALUES (?)",
+				(datos,)
+			)
+
+
+def publicar_y_confirmar(dato, timeout=10):
+	with _publish_condition:
+		resultado = client.publish("General/datos", dato, qos=2)
+		if all(hasattr(resultado, attribute) for attribute in
+			   ("rc", "wait_for_publish", "is_published")):
+			if resultado.rc != mqttClient.MQTT_ERR_SUCCESS:
+				return False
+			publicacion = resultado
+			evento = None
+		else:
+			rc, mid = resultado
+			if rc != mqttClient.MQTT_ERR_SUCCESS:
+				return False
+			evento = threading.Event()
+			_pending_publish_events[mid] = evento
+
+	if evento is not None:
+		try:
+			return evento.wait(timeout)
+		finally:
+			with _publish_condition:
+				_pending_publish_events.pop(mid, None)
+
+	publicacion.wait_for_publish(timeout=timeout)
+	return publicacion.is_published()
 
 
 def enviadeBD():
 	"""Envía los datos que hay en BD"""
-	#Conecto al MQTT cada vez que envío por si se ha perdido internet o lo que sea
-	if Connected==True:
-		#Lee las lecturas de la BD
+	if not Connected:
+		return
+
+	try:
+		with closing(lite.connect('Lecturas.sqlite')) as con:
+			con.row_factory = lite.Row
+			rows = con.execute(
+				"SELECT id, dato FROM Lecturas_guardadas_inverters_Solarmax"
+			).fetchall()
+	except lite.Error as e:
+		print("Error al leer la cola de SQLite: {}".format(e))
+		return
+
+	for row in rows:
+		dato_id = row["id"]
+		dato = row["dato"]
+		print("Envío dato de BD")
+		print(dato)
 		try:
-		#Leo el KDY guardado para ese inverter este día
-			con = lite.connect('Lecturas.sqlite') 
-			with con:
-				con.row_factory = lite.Row
-				cur = con.cursor()    
-				cur.execute("SELECT * FROM Lecturas_guardadas_inverters_Solarmax")
-				rows = cur.fetchall()
-				#Si devuelve algo, lo trato uno a uno
-			for row in rows:
-				id=row["id"]
-				dato=row["dato"]
-				print("Envío dato de BD")
-				print(dato)
-				#Intento enviar
-				resultado=client.publish("General/datos",dato,2)
-				#Si la envía con éxito, la borra de la BD
-				if (resultado[0]==0 or resultado[0]==4):
-					borraDatoBD(id)
-				else:
-					print("Fallo al enviar, ¿no hay internet?") 
-				time.sleep(1)	
+			# Keep the row until the QoS 2 delivery handshake completes.
+			if not publicar_y_confirmar(dato):
+				print("Publicación sin confirmar; se conserva el dato en SQLite.")
+			else:
+				borraDatoBD(dato_id)
 		except Exception as e:
-			print(e) 
-		finally:       
-			con.close()   
-   
+			print("Error al enviar el dato {}: {}".format(dato_id, e))
+		time.sleep(1)
 
 
 
-
-def borraDatoBD(id):
-	"""Borra de la BD el dato con la id pasada"""
-	con = lite.connect('Lecturas.sqlite') 
-	with con:
-		con.row_factory = lite.Row
-		cur = con.cursor()    
-		cur.execute("DELETE FROM Lecturas_guardadas_inverters_Solarmax WHERE id="+str(id))
-		print("Borrada linea de BD con id="+str(id))
+def borraDatoBD(dato_id):
+	"""Borra de la BD el dato con la id pasada."""
+	with closing(lite.connect('Lecturas.sqlite')) as con:
+		with con:
+			con.execute(
+				"DELETE FROM Lecturas_guardadas_inverters_Solarmax WHERE id = ?",
+				(dato_id,)
+			)
+	print("Borrada linea de BD con id={}".format(dato_id))
 
 #endregion
 
 #region PRESIONAR TECLA
 # Función para verificar si se ha presionado una tecla
 def tecla_presionada():
-	dr, dw, de = select.select([sys.stdin], [], [], 0)
+	dr, _, _ = select.select([sys.stdin], [], [], 0)
 	return dr
 
 # Configuración para habilitar la detección sin bloquear el input
@@ -315,9 +351,8 @@ def esperar_tecla():
 		print('.',end='')
 		sys.stdout.flush()
 		if tecla_presionada():
-			tecla = sys.stdin.read(1)  # Lee un carácter
+			sys.stdin.read(1)
 			restaurar_teclado(old_settings)
-			#print(f"Se presionó la tecla: {tecla}")
 			return True
 		time.sleep(0.1)  # Pequeña pausa para no consumir demasiado CPU
 	
@@ -329,26 +364,23 @@ def esperar_tecla():
 def deboLeer():
 	"""Devuelve True si es un minuto de los de leer y todavía no ha leído"""
 	global leido
-	now=datetime.now()
-	minutos=now.strftime("%M")
+	minutos = datetime.now().minute
 	#Sólo se tiene que hacer a los cuartos
 	print(minutos,end=',')
 	sys.stdout.flush()
-	if int(minutos) in [0,15,30,45]:
+	if minutos in (0, 15, 30, 45):
 		#Sólo lo hago si no lo he leido ya este minuto
 		if not leido:
 			leido=True #Marco que ha leído este minuto
 			return True
-	else:
-		leido=False
 		return False
+	leido=False
+	return False
 
 
 def esHoraCero():
 	"""Devuelve True si la hora actual está entre las 00:00 y las 00:59"""
-	now = datetime.now()
-	hora = now.strftime("%H")
-	return hora == "00"
+	return datetime.now().hour == 0
 
 #AQUÍ EMPIEZA EL MAIN
 def main():
@@ -356,15 +388,10 @@ def main():
 	root = ET.parse('configSerie.xml').getroot()
 	planta=root.attrib['Nombre']
 	puerto=root.attrib['Puerto']
-	ser = serial.Serial(puerto, 19200)  # open serial port
-	print("puerto usado: "+ser.name)         # check which port was really used
-	linea=""
-	datos_inverters=[]
-
-	for child in root:
-		temp=[]
-		temp.append(child.find("Numero").text.split(","))
-		datos_inverters.append(temp)
+	datos_inverters = [
+		child.find("Numero").text.split(",")
+		for child in root
+	]
 
 
 	#Leo la configuración desde el archivo
@@ -398,40 +425,47 @@ def main():
 				#Reconecto al servidor MQTT
 				conectar(user, password, broker_address, port)
 				veces=0
-				while Connected != True and veces<50:    #Wait for connection
+				while not Connected and veces < 50:    #Wait for connection
 					time.sleep(0.1)
 					print("espero reconexión")
 					veces+=1
 				serial_port = open_serial_port(puerto)
-				#Recorro los inverters y hago las peticiones de datos
-				for inverter in datos_inverters:
-					for inverter_numero in inverter[0]:
-						req_data = construct_inverter_query(int(inverter_numero), [KDY,PAC,KMT,SAL,SYS,IL1,IL2,IL3,IDC,TKK,UL1,UL2,UL3,UDC,UGD])				
-						print(inverter_numero+"-"+req_data)
-						try:
-							data = read_inverter(req_data, serial_port, 1)
-							print (data)
-							if data !="":
-								data = convert_data(data)
-								print("Guardo en BD datos del inverter "+inverter_numero)
-								print(planta+"/datos")
-								print (data)
-								print(data['KDY'])
-								#Si es la hora cero pongo a cero la energía diaria porque puede salir la del día anterior
-								if esHoraCero():
-									data['KDY']=0
-								guardaBD(json.dumps(data))		 
-						except Exception as e:
-							print(e)
-							pass
-						time.sleep(2)
-				#Desconecto del servidor
-				serial_port.close()	
+				print("puerto usado: {}".format(serial_port.name))
+				try:
+					#Recorro los inverters y hago las peticiones de datos
+					for inverter in datos_inverters:
+						for inverter_numero in inverter:
+							try:
+								req_data = construct_inverter_query(
+									int(inverter_numero),
+									[KDY, PAC, KMT, SAL, SYS, IL1, IL2, IL3, IDC,
+									 TKK, UL1, UL2, UL3, UDC, UGD]
+								)
+								if not req_data:
+									continue
+								print("{}-{}".format(inverter_numero, req_data))
+								data = read_inverter(req_data, serial_port, 1)
+								print(data)
+								if data:
+									data = convert_data(data)
+									print("Guardo en BD datos del inverter {}".format(inverter_numero))
+									print(planta + "/datos")
+									print(data)
+									print(data['KDY'])
+									#Si es la hora cero pongo a cero la energía diaria porque puede salir la del día anterior
+									if esHoraCero():
+										data['KDY'] = 0
+									guardaBD(json.dumps(data))
+							except Exception as e:
+								print("Error al leer el inverter {}: {}".format(inverter_numero, e))
+							time.sleep(2)
+				finally:
+					serial_port.close()
 				#Intento enviar los datos de la BD
 				enviadeBD()	
 				time.sleep(10)	
 				#Desconecto del servidor MQTT
-				if Connected==True:
+				if Connected:
 					print("Desconecto del servidor MQTT")
 					client.disconnect()
 					client.loop_stop()
